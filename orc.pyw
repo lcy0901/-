@@ -1,10 +1,8 @@
 import sys
-import io
 import threading
 import numpy as np
-from PIL import Image
-from PySide6.QtCore import Qt, QRect, QBuffer, QIODevice, QTimer
-from PySide6.QtGui import QPainter, QColor, QPen, QPixmap
+from PySide6.QtCore import Qt, QRect, QTimer
+from PySide6.QtGui import QPainter, QColor, QPen, QPixmap, QImage
 from PySide6.QtWidgets import QApplication, QWidget
 
 # ---------- OCR 在后台线程加载，不阻塞界面 ----------
@@ -38,14 +36,18 @@ class SnipOverlay(QWidget):
         self.setGeometry(QApplication.primaryScreen().geometry())
         self.setCursor(Qt.CrossCursor)
         self.setFocusPolicy(Qt.StrongFocus)
+        # 预先算好压暗后的背景，之后每次重绘直接用它
+        self.dimmed = self.shot.copy()
+        _p = QPainter(self.dimmed)
+        _p.fillRect(self.shot.rect(), QColor(0, 0, 0, 90))
+        _p.end()
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.drawPixmap(0, 0, self.shot)
-        p.fillRect(self.rect(), QColor(0, 0, 0, 90))
+        p.drawPixmap(0, 0, self.dimmed)  # 直接画预先压暗的背景，不再每次 fillRect
         if self.start and self.end:
             r = QRect(self.start, self.end).normalized()
-            p.drawPixmap(r, self.shot, self._scaled_rect(r))
+            p.drawPixmap(r, self.shot, self._scaled_rect(r))  # 选区内画原图（亮的）
             p.setPen(QPen(QColor(0, 160, 255), 2))
             p.drawRect(r)
         p.end()
@@ -71,8 +73,11 @@ class SnipOverlay(QWidget):
 
     def mouseMoveEvent(self, event):
         if self.start:
+            old = QRect(self.start, self.end).normalized()
             self.end = event.position().toPoint()
-            self.update()
+            new = QRect(self.start, self.end).normalized()
+            # 只刷新新旧选区的并集，而不是整个窗口
+            self.update(old.united(new).adjusted(-4, -4, 4, 4))
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self.start:
@@ -83,17 +88,20 @@ class SnipOverlay(QWidget):
                 self._finish(None)
 
 
+def pixmap_to_bgr(pixmap: QPixmap) -> np.ndarray:
+    img = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB888)
+    w, h, bpl = img.width(), img.height(), img.bytesPerLine()
+    buf = np.frombuffer(bytes(img.constBits()), dtype=np.uint8, count=bpl * h)
+    arr = buf.reshape(h, bpl)[:, : w * 3].reshape(h, w, 3)
+    return np.ascontiguousarray(arr[:, :, ::-1])   # RGB -> BGR
+
 def run_ocr(pixmap: QPixmap) -> str:
     if not _ocr_ready.wait(timeout=60):
         raise RuntimeError("OCR 模型加载超时")
     if _ocr_error is not None:
         raise _ocr_error
 
-    buf = QBuffer()
-    buf.open(QIODevice.WriteOnly)
-    pixmap.save(buf, "PNG")
-    img = Image.open(io.BytesIO(bytes(buf.data()))).convert("RGB")
-    arr = np.ascontiguousarray(np.array(img)[:, :, ::-1])  # RGB -> BGR，并保证内存连续
+    arr = pixmap_to_bgr(pixmap)       # 这里调用，替换原来的 QBuffer/PNG/PIL 那一串
     result, _ = _ocr(arr)
     if not result:
         return ""
